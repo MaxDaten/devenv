@@ -75,6 +75,35 @@ impl ShellKeyChord {
         }
     }
 
+    /// Whether `input` is this chord, in its legacy encoding or as reported by
+    /// the kitty keyboard protocol / xterm modifyOtherKeys. Programs running in
+    /// the shell (fish 4, Claude Code, editors) enable those modes, so the
+    /// legacy bytes alone are not enough.
+    pub fn matches_input(&self, input: &[u8]) -> bool {
+        self.terminal_bytes() == input
+            || ExtendedKey::parse(input).is_some_and(|key| self.matches_extended(key))
+    }
+
+    fn matches_extended(&self, key: ExtendedKey) -> bool {
+        let (codepoint, implicit_shift) = match self.code {
+            ShellKeyCode::Char(character) => (character as u32, false),
+            ShellKeyCode::Space => (u32::from(b' '), false),
+            ShellKeyCode::Enter => (13, false),
+            ShellKeyCode::Tab => (9, false),
+            ShellKeyCode::BackTab => (9, true),
+            ShellKeyCode::Esc => (27, false),
+            ShellKeyCode::Backspace => (127, false),
+            _ => return false,
+        };
+        // kitty reports the unshifted key, modifyOtherKeys the shifted character.
+        let shifted = match self.code {
+            ShellKeyCode::Char(character) if self.shift => shifted_character(character) as u32,
+            _ => codepoint,
+        };
+        (key.codepoint == codepoint || key.codepoint == shifted)
+            && key.modifiers == u32::from(self.xterm_modifier(implicit_shift) - 1)
+    }
+
     pub fn terminal_bytes(&self) -> Vec<u8> {
         match self.code {
             ShellKeyCode::Char(character) => self.character_bytes(character),
@@ -383,7 +412,7 @@ impl ShellKeybindings {
         ShellAction::INTERCEPTED.into_iter().find(|action| {
             self.bindings(*action)
                 .iter()
-                .any(|binding| binding.terminal_bytes() == input)
+                .any(|binding| binding.matches_input(input))
         })
     }
 
@@ -435,6 +464,49 @@ pub struct ShellKeybindingConflict {
     pub first: ShellAction,
     pub second: ShellAction,
     pub chord: String,
+}
+
+/// A key press in kitty keyboard protocol form (`CSI code[:alt...] [; mods[:event] [; text]] u`)
+/// or xterm modifyOtherKeys form (`CSI 27 ; mods ; code ~`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExtendedKey {
+    codepoint: u32,
+    /// xterm modifier bits (shift 1, alt 2, ctrl 4, super 8, ...) with Caps/Num Lock removed.
+    modifiers: u32,
+}
+
+impl ExtendedKey {
+    const LOCK_MODIFIERS: u32 = 64 | 128;
+    const KITTY_RELEASE_EVENT: &str = "3";
+
+    fn parse(input: &[u8]) -> Option<Self> {
+        let body = std::str::from_utf8(input.strip_prefix(b"\x1b[")?).ok()?;
+        let (codepoint, modifiers) = if let Some(params) = body.strip_suffix('u') {
+            let mut fields = params.split(';');
+            let codepoint = fields.next()?.split(':').next()?;
+            let mut modifier = fields.next().unwrap_or("1").split(':');
+            let modifiers = modifier.next()?;
+            if modifier.next() == Some(Self::KITTY_RELEASE_EVENT) {
+                return None;
+            }
+            (codepoint, modifiers)
+        } else {
+            let mut fields = body.strip_suffix('~')?.split(';');
+            if fields.next()? != "27" {
+                return None;
+            }
+            let modifiers = fields.next()?;
+            let codepoint = fields.next()?;
+            if fields.next().is_some() {
+                return None;
+            }
+            (codepoint, modifiers)
+        };
+        Some(Self {
+            codepoint: codepoint.parse().ok()?,
+            modifiers: modifiers.parse::<u32>().ok()?.checked_sub(1)? & !Self::LOCK_MODIFIERS,
+        })
+    }
 }
 
 fn control_byte(character: char) -> Option<u8> {
@@ -516,6 +588,84 @@ mod tests {
         assert_eq!(chord.terminal_bytes(), b"\x1b!");
         let chord = ShellKeyChord::new(ShellKeyCode::BackTab, false, false, false);
         assert_eq!(chord.terminal_bytes(), b"\x1b[Z");
+    }
+
+    #[test]
+    fn default_bindings_match_kitty_keyboard_protocol_input() {
+        // What Ghostty sends for Ctrl-Alt-D/W/E once fish 4 or Claude Code
+        // pushes `CSI = 5 u` / `CSI > 5 u`.
+        let bindings = ShellKeybindings::default();
+        assert_eq!(
+            bindings.action_for_input(b"\x1b[100;7u"),
+            Some(ShellAction::TogglePause)
+        );
+        assert_eq!(
+            bindings.action_for_input(b"\x1b[119;7u"),
+            Some(ShellAction::ListWatchedFiles)
+        );
+        assert_eq!(
+            bindings.action_for_input(b"\x1b[101;7u"),
+            Some(ShellAction::ToggleError)
+        );
+    }
+
+    #[test]
+    fn default_bindings_match_modify_other_keys_input() {
+        // xterm modifyOtherKeys mode 2 (`CSI > 4;2 m`), as pushed by Claude Code.
+        let bindings = ShellKeybindings::default();
+        assert_eq!(
+            bindings.action_for_input(b"\x1b[27;7;100~"),
+            Some(ShellAction::TogglePause)
+        );
+    }
+
+    #[test]
+    fn kitty_input_tolerates_optional_fields_and_lock_modifiers() {
+        let bindings = ShellKeybindings::default();
+        // press event type, alternate-key sub-field, Caps Lock (+64) and Num Lock (+128)
+        for input in [
+            &b"\x1b[100;7:1u"[..],
+            b"\x1b[100:68;7u",
+            b"\x1b[100;71u",
+            b"\x1b[100;199u",
+        ] {
+            assert_eq!(
+                bindings.action_for_input(input),
+                Some(ShellAction::TogglePause),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kitty_input_rejects_other_chords_and_releases() {
+        let bindings = ShellKeybindings::default();
+        for input in [
+            &b"\x1b[100;5u"[..], // Ctrl-D
+            b"\x1b[100;3u",      // Alt-D
+            b"\x1b[100;15u",     // Ctrl-Alt-Super-D
+            b"\x1b[100;8u",      // Ctrl-Alt-Shift-D
+            b"\x1b[100;7:3u",    // key release
+            b"\x1b[27;5;100~",   // modifyOtherKeys Ctrl-D
+            b"\x1b[100;7u\x1b[100;7u",
+            b"\x1b[;7u",
+            b"\x1b[100;u",
+        ] {
+            assert_eq!(bindings.action_for_input(input), None, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn shifted_and_named_chords_match_kitty_input() {
+        let chord = ShellKeyChord::new(ShellKeyCode::Char('p'), true, false, true);
+        assert!(chord.matches_input(b"\x1b[112;6u"));
+        // modifyOtherKeys reports the shifted character
+        assert!(chord.matches_input(b"\x1b[27;6;80~"));
+        let chord = ShellKeyChord::new(ShellKeyCode::Esc, false, true, false);
+        assert!(chord.matches_input(b"\x1b[27;3u"));
+        let chord = ShellKeyChord::new(ShellKeyCode::BackTab, false, false, false);
+        assert!(chord.matches_input(b"\x1b[9;2u"));
+        assert!(chord.matches_input(b"\x1b[Z"));
     }
 
     #[test]

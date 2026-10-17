@@ -2,6 +2,10 @@
 
 ## 2.4.1 (unreleased)
 
+### Bug Fixes
+
+- Fixed `devenv shell` keybindings (Ctrl-Alt-D/W/E and remapped chords) being ignored while the foreground program uses the kitty keyboard protocol or xterm modifyOtherKeys, as fish 4 and Claude Code do ([#3294](https://github.com/cachix/devenv/issues/3294)).
+
 ## 2.4.0 (2026-09-24)
 
 ### Bug Fixes
